@@ -965,15 +965,15 @@ input[type=file] { display: none; }
       <div class="pagination" id="pg-maps"></div>
     </div>
 
-    <!-- TIEMPO (NUEVA VERSIÓN DINÁMICA) -->
+    <!-- TIEMPO -->
     <div id="panel-tiempo" class="panel">
       <div class="panel-head">
         <div>
           <div class="panel-title">Control de Tiempo</div>
-          <div class="panel-subtitle">Seguimiento de tiempos de atención por técnico y orden (Tiempo Total calculado en tiempo real)</div>
+          <div class="panel-subtitle">Seguimiento de tiempos de atención por técnico y orden (Tiempo Total calculado en tiempo real con la fecha/hora del sistema)</div>
         </div>
         <div class="panel-actions">
-          <button class="btn btn-outline btn-sm" onclick="renderTiempo()">↻ Actualizar Tiempos</button>
+          <button class="btn btn-outline btn-sm" onclick="renderTiempo()">🔄 Actualizar Tiempos</button>
         </div>
       </div>
       <div class="panel-body" id="bodyTiempo"></div>
@@ -1204,10 +1204,10 @@ function loadFile(file){
   const r = new FileReader();
   r.onload = e => {
     try {
-      WB = XLSX.read(e.target.result, { type:'binary', cellDates:false, raw:false, dateNF:'dd/mm/yyyy' });
+      WB = XLSX.read(e.target.result, { type:'binary', cellDates:true, raw:true, dateNF:'dd/mm/yyyy hh:mm:ss' });
       WB.SheetNames.forEach(n => {
         const ws = WB.Sheets[n];
-        const d = XLSX.utils.sheet_to_json(ws,{ header:1, defval:'', raw:false });
+        const d = XLSX.utils.sheet_to_json(ws,{ header:1, defval:'', raw:true });
         sheets[n] = d;
         mdata[n] = d.map(r=>[...r]);
       });
@@ -1385,7 +1385,7 @@ function buildDashboard(){
 }
 
 // ====================== TABLE RENDERER ======================
-function getRows(sheetName){ return (mdata[sheetName]||[]).slice(1).filter(r=>r.some(c=>c!=='')); }
+function getRows(sheetName){ return (mdata[sheetName]||[]).slice(1).filter(r=>r.some(c=>c!=='' && c!==undefined)); }
 function getHeaders(sheetName){ return (mdata[sheetName]||[])[0]||[]; }
 
 function colIdx(H, ...names){ for(const n of names){ const i=H.indexOf(n); if(i>=0) return i; } return -1; }
@@ -1431,11 +1431,11 @@ function renderTableHTML(key, sheetName, cols, filteredRows){
       return `<td title="${s.replace(/"/g,'&quot;')}">${disp||'—'}</td>`;
     }).join('');
     const globalIdx = start+ri+1;
-    return `<tr onclick="openDetail('${sheetName}',${globalIdx})" ondblclick="openDetail('${sheetName}',${globalIdx})">${tds}</table>`;
+    return `<tr onclick="openDetail('${sheetName}',${globalIdx})" ondblclick="openDetail('${sheetName}',${globalIdx})">${tds}</tr>`;
   }).join('');
 
   const tableEl = document.getElementById('tw-'+key);
-  if(tableEl) tableEl.innerHTML = `<table>${thead}<tbody>${tbody||`<tr><td colspan="${cols.length}" style="text-align:center;padding:3rem;color:var(--text2)">Sin resultados para el filtro aplicado</td></tr>`}</tbody></table>`;
+  if(tableEl) tableEl.innerHTML = `</table>${thead}<tbody>${tbody||`<tr><td colspan="${cols.length}" style="text-align:center;padding:3rem;color:var(--text2)">Sin resultados para el filtro aplicado</td></tr>`}</tbody></table>`;
 
   // Pagination
   const pgEl = document.getElementById('pg-'+key);
@@ -1622,76 +1622,115 @@ function switchSubTab(panelId, subKey, sheetName){
   }
 }
 
+// ====================== FUNCIÓN PARA CONVERTIR FECHAS DE EXCEL ======================
+function excelDateToJSDate(serial) {
+  if (!serial) return null;
+  // Si ya es un objeto Date
+  if (serial instanceof Date) return serial;
+  // Si es un número (fecha serial de Excel)
+  if (typeof serial === 'number') {
+    // Excel usa 1/1/1900 como día 1 (considerando el bug de 1900)
+    const utc_days = serial - 25569;
+    const date = new Date(utc_days * 86400000);
+    return date;
+  }
+  // Si es string, intentar parsear
+  const parsed = new Date(serial);
+  if (!isNaN(parsed)) return parsed;
+  return null;
+}
+
 // ====================== NUEVA FUNCIÓN: CÁLCULO DINÁMICO DE TIEMPO ======================
-function calcularTiempoDinamico(fechaBase, estado, horaInicio, horaProceso) {
-  if (!fechaBase) return null;
-  
+// Esta función replica EXACTAMENTE la lógica de la macro de Excel
+function calcularTiempoTranscurrido(estado, hInicio, hProceso) {
+  // Obtener la fecha/hora actual del sistema
   const ahora = new Date();
-  let fechaReferencia = new Date(fechaBase);
   
-  // Si la fecha es inválida, retornar null
-  if (isNaN(fechaReferencia.getTime())) return null;
+  let fechaUsar = null;
   
-  // Ajustar según el estado (misma lógica que la macro)
+  // Convertir las fechas si son números seriales de Excel
+  let fechaInicio = excelDateToJSDate(hInicio);
+  let fechaProceso = excelDateToJSDate(hProceso);
+  
+  // Según el estado, determinar qué fecha usar (misma lógica que la macro)
   if (estado === 'EN CAMINO') {
     // Para EN CAMINO: usar la fecha más reciente entre H_Inicio y H_Proceso
-    if (horaProceso && new Date(horaProceso) > fechaReferencia) {
-      fechaReferencia = new Date(horaProceso);
-    }
-    if (horaInicio && new Date(horaInicio) > fechaReferencia) {
-      fechaReferencia = new Date(horaInicio);
+    if (fechaInicio && fechaProceso) {
+      fechaUsar = fechaProceso >= fechaInicio ? fechaProceso : fechaInicio;
+    } else if (fechaProceso) {
+      fechaUsar = fechaProceso;
+    } else if (fechaInicio) {
+      fechaUsar = fechaInicio;
     }
   } else if (estado === 'EN PROCESO') {
     // Para EN PROCESO: priorizar H_Proceso, si no existe usar H_Inicio
-    if (horaProceso && new Date(horaProceso) > fechaReferencia) {
-      fechaReferencia = new Date(horaProceso);
-    } else if (horaInicio && new Date(horaInicio) > fechaReferencia) {
-      fechaReferencia = new Date(horaInicio);
+    if (fechaProceso) {
+      fechaUsar = fechaProceso;
+    } else if (fechaInicio) {
+      fechaUsar = fechaInicio;
     }
   }
   
-  // Calcular diferencia en días
-  const diffDias = (ahora - fechaReferencia) / (1000 * 60 * 60 * 24);
+  // Si no hay fecha válida, retornar null
+  if (!fechaUsar || isNaN(fechaUsar.getTime())) {
+    return null;
+  }
   
-  // Convertir a horas y minutos para mostrar
-  const diffHoras = diffDias * 24;
-  const horas = Math.floor(diffHoras);
-  const minutos = Math.floor((diffHoras - horas) * 60);
+  // Calcular la diferencia (ahora - fechaUsar) en días
+  let delta = (ahora - fechaUsar) / (1000 * 60 * 60 * 24);
+  
+  // Si delta es negativo (fecha futura), mostrar como 0
+  if (delta < 0) {
+    delta = 0;
+  }
+  
+  // Formatear como [h]:mm (horas:minutos)
+  const horasTotales = delta * 24;
+  const horas = Math.floor(horasTotales);
+  const minutos = Math.floor((horasTotales - horas) * 60);
   
   return {
-    diffDias: diffDias,
-    diffHoras: diffHoras,
-    horas: horas,
-    minutos: minutos,
+    delta: delta,
+    horasTotales: horasTotales,
     texto: `${horas}:${minutos.toString().padStart(2, '0')}`,
-    fechaReferencia: fechaReferencia
+    fechaReferencia: fechaUsar
   };
 }
 
-function calcularPrioridad(estado, tiempoObj) {
-  if (!tiempoObj) return 1;
-  
-  const diffHoras = tiempoObj.diffHoras;
+// Calcular prioridad según la misma lógica de la macro
+function calcularPrioridad(estado, delta) {
+  if (delta === null) return 1;
   
   if (estado === 'EN CAMINO') {
-    if (diffHoras > 1) return 3;      // > 1 hora = prioridad 3 (rojo)
-    if (diffHoras > 0.024306) return 2; // > 35 minutos = prioridad 2 (amarillo)
-    return 1;
+    // Si delta > 1 hora (1/24 día) -> prioridad 3
+    if (delta > 1 / 24) {
+      return 3;
+    }
+    // Si delta > 35 minutos (0.024306 días) -> prioridad 2
+    else if (delta > 0.024306) {
+      return 2;
+    }
   } else if (estado === 'EN PROCESO') {
-    if (diffHoras > 2) return 3;      // > 2 horas = prioridad 3 (rojo)
-    if (diffHoras > 1) return 2;       // > 1 hora = prioridad 2 (amarillo)
-    return 1;
+    // Si delta > 2 horas -> prioridad 3
+    if (delta > 2 / 24) {
+      return 3;
+    }
+    // Si delta > 1 hora -> prioridad 2
+    else if (delta > 1 / 24) {
+      return 2;
+    }
   }
   return 1;
 }
 
-function getColorPorPrioridad(prioridad, estado) {
+// Obtener color según prioridad (mismos colores que la macro)
+function getColorPorPrioridad(prioridad) {
   if (prioridad === 3) {
-    return { bg: '#c00000', text: '#ffffff', border: '#8b0000' };
+    return { bg: '#c00000', text: '#ffffff' };  // Rojo
   } else if (prioridad === 2) {
-    return { bg: '#ffbf00', text: '#000000', border: '#e6a800' };
+    return { bg: '#ffbf00', text: '#000000' };  // Amarillo
   }
-  return { bg: '#ffffff', text: '#1a1d2e', border: '#e2e6ef' };
+  return { bg: '#ffffff', text: '#1a1d2e' };    // Normal
 }
 
 // ====================== NUEVA VERSIÓN DE RENDER TIEMPO ======================
@@ -1703,7 +1742,7 @@ function renderTiempo() {
   }
   
   const H = base[0];
-  const rows = base.slice(1).filter(r => r[0]);
+  const rows = base.slice(1).filter(r => r[0] && r[0] !== '');
   
   // Índices de columnas necesarias
   const tecnicoIdx = H.indexOf('Tecnico');
@@ -1714,7 +1753,6 @@ function renderTiempo() {
   const tramoIdx = H.indexOf('Tramo');
   const hInicioIdx = H.indexOf('H_Inicio');
   const hProcesoIdx = H.indexOf('H_Proceso');
-  const tiempoIdx = H.indexOf('TIEMPO');
   const observacionesIdx = H.indexOf('Observaciones');
   const negocioIdx = H.indexOf('NEGOCIO');
   
@@ -1731,7 +1769,7 @@ function renderTiempo() {
     return;
   }
   
-  // Procesar cada fila con cálculos dinámicos
+  // Procesar cada fila con cálculos dinámicos (misma lógica que la macro)
   const processedRows = tiempoRows.map(row => {
     const tecnico = String(row[tecnicoIdx] || '—');
     const codigo = String(row[codigoIdx] || '—');
@@ -1743,61 +1781,73 @@ function renderTiempo() {
     const hProceso = row[hProcesoIdx];
     const observaciones = String(row[observacionesIdx] || '');
     
-    // Determinar fecha base para cálculo
-    let fechaBase = null;
-    if (estado === 'EN CAMINO') {
-      fechaBase = hInicio || hProceso;
-    } else if (estado === 'EN PROCESO') {
-      fechaBase = hProceso || hInicio;
+    // Aplicar regla especial: si el técnico es "MARCO VALENCIA", cambiarlo a "SERGIO ALVARADO"
+    let tecnicoFinal = tecnico;
+    if (tecnicoFinal.toUpperCase() === 'MARCO VALENCIA') {
+      tecnicoFinal = 'SERGIO ALVARADO';
     }
     
-    // Calcular tiempo dinámico
-    const tiempoCalculado = calcularTiempoDinamico(fechaBase, estado, hInicio, hProceso);
-    const prioridad = calcularPrioridad(estado, tiempoCalculado);
-    const colores = getColorPorPrioridad(prioridad, estado);
+    // Calcular tiempo usando la misma lógica que la macro
+    const tiempoCalc = calcularTiempoTranscurrido(estado, hInicio, hProceso);
+    const delta = tiempoCalc ? tiempoCalc.delta : null;
+    const prioridad = calcularPrioridad(estado, delta);
+    const colores = getColorPorPrioridad(prioridad);
+    
+    // Formatear fechas para mostrar
+    const fechaInicio = excelDateToJSDate(hInicio);
+    const fechaProceso = excelDateToJSDate(hProceso);
+    
+    const hInicioStr = fechaInicio ? fechaInicio.toLocaleString() : '—';
+    const hProcesoStr = fechaProceso ? fechaProceso.toLocaleString() : '—';
     
     return {
-      tecnico,
+      tecnico: tecnicoFinal,
       codigo,
       dni,
       estado,
       quantum,
       tramo,
-      hInicio: hInicio ? new Date(hInicio).toLocaleString() : '—',
-      hProceso: hProceso ? new Date(hProceso).toLocaleString() : '—',
-      tiempoCalculado,
+      hInicio: hInicioStr,
+      hProceso: hProcesoStr,
+      tiempoTexto: tiempoCalc ? tiempoCalc.texto : '0:00',
       prioridad,
       colores,
       observaciones,
-      rawRow: row
+      delta: delta
     };
   });
   
   // Ordenar: prioridad descendente, luego tiempo descendente
   processedRows.sort((a, b) => {
     if (a.prioridad !== b.prioridad) return b.prioridad - a.prioridad;
-    const tiempoA = a.tiempoCalculado?.diffHoras || 0;
-    const tiempoB = b.tiempoCalculado?.diffHoras || 0;
-    return tiempoB - tiempoA;
+    const deltaA = a.delta || 0;
+    const deltaB = b.delta || 0;
+    return deltaB - deltaA;
   });
   
-  // Detectar duplicados por técnico
+  // Detectar duplicados por técnico (misma lógica que la macro)
   const tecnicoCount = {};
   processedRows.forEach(r => {
     tecnicoCount[r.tecnico] = (tecnicoCount[r.tecnico] || 0) + 1;
   });
   
   // Generar HTML
-  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1rem;margin-bottom:1.5rem">';
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin-bottom:1.5rem">';
   
-  processedRows.forEach((item, idx) => {
+  processedRows.forEach((item) => {
     const isDuplicate = tecnicoCount[item.tecnico] > 1;
-    const duplicateStyle = isDuplicate ? 'border: 2px solid #ffcdcd; background: #fff5f5;' : '';
+    // Fondo rosa claro para técnicos con múltiples órdenes (como la macro)
+    const duplicateStyle = isDuplicate ? 'background: #fff5f5; border: 2px solid #ffcdcd;' : '';
+    
+    // Determinar color de borde según prioridad
+    let borderColor = '#e2e6ef';
+    if (item.prioridad === 3) borderColor = '#c00000';
+    else if (item.prioridad === 2) borderColor = '#ffbf00';
     
     html += `
-      <div class="card" style="${duplicateStyle}">
-        <div class="card-head" style="border-left: 4px solid ${item.colores.bg === '#c00000' ? '#c00000' : (item.colores.bg === '#ffbf00' ? '#ffbf00' : '#3b5bdb')}">
-          <span class="card-title">👷 ${item.tecnico}</span>
+      <div class="card" style="${duplicateStyle} border-left: 4px solid ${borderColor};">
+        <div class="card-head" style="background: ${item.colores.bg};">
+          <span class="card-title" style="color: ${item.colores.text};">👷 ${item.tecnico}</span>
           <span class="badge ${badgeCls(item.estado)}">${item.estado}</span>
         </div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:0.6rem">
@@ -1821,11 +1871,11 @@ function renderTiempo() {
             <span style="font-size:0.75rem;color:var(--text2)">H_PROCESO</span>
             <span style="font-size:0.8rem;font-weight:600;font-family:JetBrains Mono,monospace">${item.hProceso}</span>
           </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;background:${item.colores.bg};padding:8px;border-radius:8px;margin-top:4px">
+          <div style="display:flex;justify-content:space-between;align-items:center;background:${item.colores.bg};padding:10px;border-radius:8px;margin-top:4px">
             <span style="font-size:0.75rem;color:${item.colores.text};font-weight:700">⏱ TIEMPO TOTAL</span>
             <div style="text-align:right">
-              <span style="font-size:1.3rem;font-weight:800;font-family:JetBrains Mono,monospace;color:${item.colores.text}">${item.tiempoCalculado?.texto || '0:00'}</span>
-              ${item.prioridad > 1 ? `<div style="font-size:0.65rem;color:${item.colores.text};margin-top:2px">Prioridad ${item.prioridad} ${item.prioridad === 3 ? '⚠️ Crítica' : '⚠️ Demora'}</div>` : ''}
+              <span style="font-size:1.3rem;font-weight:800;font-family:JetBrains Mono,monospace;color:${item.colores.text}">${item.tiempoTexto}</span>
+              ${item.prioridad > 1 ? `<div style="font-size:0.7rem;color:${item.colores.text};margin-top:2px;font-weight:600">⚠️ Prioridad ${item.prioridad} ${item.prioridad === 3 ? 'Crítica' : 'Demora'}</div>` : ''}
             </div>
           </div>
           ${item.observaciones ? `<div style="font-size:0.75rem;color:var(--text2);border-top:1px solid var(--border);padding-top:0.5rem;line-height:1.4">📝 ${item.observaciones}</div>` : ''}
@@ -1836,7 +1886,7 @@ function renderTiempo() {
   
   html += '</div>';
   
-  // Mostrar resumen de tiempos
+  // Mostrar resumen de tiempos (como la macro)
   const enCamino = processedRows.filter(r => r.estado === 'EN CAMINO').length;
   const enProceso = processedRows.filter(r => r.estado === 'EN PROCESO').length;
   const prioridad3 = processedRows.filter(r => r.prioridad === 3).length;
