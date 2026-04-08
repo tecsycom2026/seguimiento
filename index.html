@@ -970,10 +970,7 @@ input[type=file] { display: none; }
       <div class="panel-head">
         <div>
           <div class="panel-title">Control de Tiempo</div>
-          <div class="panel-subtitle">Seguimiento de tiempos de atención por técnico y orden (Tiempo Total calculado en tiempo real con la fecha/hora del sistema)</div>
-        </div>
-        <div class="panel-actions">
-          <button class="btn btn-outline btn-sm" onclick="renderTiempo()">🔄 Actualizar Tiempos</button>
+          <div class="panel-subtitle">Seguimiento de tiempos de atención por técnico y orden</div>
         </div>
       </div>
       <div class="panel-body" id="bodyTiempo"></div>
@@ -1192,8 +1189,12 @@ function stateColor(v){ return ESTADO_COLORS[String(v||'').toUpperCase()] || EST
 
 // ====================== STATE ======================
 let WB = null, sheets = {}, mdata = {}, pages = {}, searches = {}, filters = {};
-let modalSheet = null, modalRowIdx = null, modalMode = 'edit';
+let modalSheet = null, modalRowIdx = null, modalMode = 'edit'; // 'edit' | 'new'
 let activeVentaSub = 'VENTA';
+
+// Tiempo engine state (declaradas aquí, usadas en el bloque TIEMPO ENGINE)
+let _tiempoInterval = null;
+let _tiempoRecords = [];
 
 // ====================== FILE HANDLING ======================
 function handleDrop(e){ e.preventDefault(); document.getElementById('dropZone').classList.remove('over'); const f=e.dataTransfer.files[0]; if(f) loadFile(f); }
@@ -1204,12 +1205,17 @@ function loadFile(file){
   const r = new FileReader();
   r.onload = e => {
     try {
-      WB = XLSX.read(e.target.result, { type:'binary', cellDates:true, raw:true, dateNF:'dd/mm/yyyy hh:mm:ss' });
+      // cellDates:true → SheetJS convierte fechas a objetos JS Date directamente
+      WB = XLSX.read(e.target.result, { type:'binary', cellDates:true, raw:false });
       WB.SheetNames.forEach(n => {
         const ws = WB.Sheets[n];
-        const d = XLSX.utils.sheet_to_json(ws,{ header:1, defval:'', raw:true });
+        // Para display: strings legibles
+        const d = XLSX.utils.sheet_to_json(ws,{ header:1, defval:'', raw:false, dateNF:'dd/mm/yyyy hh:mm' });
+        // Para motor de tiempo: raw:true preserva objetos Date y seriales
+        const dRaw = XLSX.utils.sheet_to_json(ws,{ header:1, defval:'', raw:true, cellDates:true });
         sheets[n] = d;
         mdata[n] = d.map(r=>[...r]);
+        sheets[n+'__raw'] = dRaw;
       });
       document.getElementById('uploadScreen').style.display = 'none';
       document.getElementById('fileChip').style.display = 'flex';
@@ -1275,6 +1281,9 @@ function updateBadges(){
 
 // ====================== NAVIGATION ======================
 function nav(name){
+  // Detener timer de tiempo si salimos del panel
+  if(name !== 'tiempo' && _tiempoInterval){ clearInterval(_tiempoInterval); _tiempoInterval = null; }
+
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('[data-nav],[data-side]').forEach(el=>{
     const k = el.dataset.nav || el.dataset.side;
@@ -1385,7 +1394,7 @@ function buildDashboard(){
 }
 
 // ====================== TABLE RENDERER ======================
-function getRows(sheetName){ return (mdata[sheetName]||[]).slice(1).filter(r=>r.some(c=>c!=='' && c!==undefined)); }
+function getRows(sheetName){ return (mdata[sheetName]||[]).slice(1).filter(r=>r.some(c=>c!=='')); }
 function getHeaders(sheetName){ return (mdata[sheetName]||[])[0]||[]; }
 
 function colIdx(H, ...names){ for(const n of names){ const i=H.indexOf(n); if(i>=0) return i; } return -1; }
@@ -1415,7 +1424,7 @@ function renderTableHTML(key, sheetName, cols, filteredRows){
   const rc = document.getElementById('rc-'+key);
   if(rc) rc.textContent = total+' registros';
 
-  const thead = `<thead><tr>${cols.map(c=>`<th>${c.label}</th>`).join('')}</thead>`;
+  const thead = `<thead><tr>${cols.map(c=>`<th>${c.label}</th>`).join('')}</tr></thead>`;
   const tbody = pageRows.map((row,ri)=>{
     const tds = cols.map(c=>{
       const v = c.idx>=0 ? (row[c.idx]??'') : '';
@@ -1435,7 +1444,7 @@ function renderTableHTML(key, sheetName, cols, filteredRows){
   }).join('');
 
   const tableEl = document.getElementById('tw-'+key);
-  if(tableEl) tableEl.innerHTML = `</table>${thead}<tbody>${tbody||`<tr><td colspan="${cols.length}" style="text-align:center;padding:3rem;color:var(--text2)">Sin resultados para el filtro aplicado</td></tr>`}</tbody></table>`;
+  if(tableEl) tableEl.innerHTML = `<table>${thead}<tbody>${tbody||`<tr><td colspan="${cols.length}" style="text-align:center;padding:3rem;color:var(--text2)">Sin resultados para el filtro aplicado</td></tr>`}</tbody></table>`;
 
   // Pagination
   const pgEl = document.getElementById('pg-'+key);
@@ -1473,6 +1482,7 @@ function filterTable(key){
     const el = document.getElementById(`filt-${f}-${key}`);
     if(el && el.value){
       const colMap = {estado:'Estado',negocio:'NEGOCIO',tramo:'Tramo',tecnico:'Tecnico'};
+      // also handle MAPS
       if(key==='maps'){
         const mh = getHeaders('MAPS');
         if(f==='estado') filters[key]['Estado2'] = el.value;
@@ -1508,7 +1518,7 @@ function clearFilters(key){
   filterTable(key);
 }
 
-let el;
+let el; // temp var
 
 // ====================== COLUMN DEFS ======================
 function mkCols(H, defs){ return defs.map(d=>({label:d.l, idx:H.indexOf(d.k), type:d.t||'text'})); }
@@ -1622,302 +1632,428 @@ function switchSubTab(panelId, subKey, sheetName){
   }
 }
 
-// ====================== FUNCIÓN PARA CONVERTIR FECHAS DE EXCEL ======================
-function excelDateToJSDate(serial) {
-  if (!serial) return null;
-  // Si ya es un objeto Date
-  if (serial instanceof Date) return serial;
-  // Si es un número (fecha serial de Excel)
-  if (typeof serial === 'number') {
-    // Excel usa 1/1/1900 como día 1 (considerando el bug de 1900)
-    const utc_days = serial - 25569;
-    const date = new Date(utc_days * 86400000);
-    return date;
+// ====================== TIEMPO ENGINE (replica lógica macro VBA) ======================
+
+/*
+  LÓGICA VBA replicada al 100%:
+  1. Solo filas donde NEGOCIO = "ALTA NUEVA"
+  2. Solo filas donde Quantum (estado quantum) = "EN CAMINO" | "EN PROCESO"
+  3. Fecha de referencia (fechaUsar):
+     - EN CAMINO: max(H_Inicio, H_Proceso) si ambos existen, sino el que exista
+     - EN PROCESO: H_Proceso primero, sino H_Inicio
+  4. Tiempo = now() - fechaUsar  → dinámico, se actualiza cada segundo
+  5. Prioridad:
+     - EN CAMINO: >1h → 3, >35min → 2, else → 1
+     - EN PROCESO: >2h → 3, >1h → 2, else → 1
+  6. Alertas de color (igual que formato condicional Excel):
+     - EN CAMINO  >35min ≤1h  → amarillo
+     - EN CAMINO  >1h         → rojo
+     - EN PROCESO >1h  ≤2h    → amarillo
+     - EN PROCESO >2h         → rojo
+  7. Orden: PRIORIDAD DESC, TIEMPO DESC
+  8. "MARCO VALENCIA" se muestra como "SERGIO ALVARADO"
+*/
+
+function buildTiempoRecords(){
+  // Usamos la versión RAW para obtener fechas precisas como objetos Date
+  // SheetJS con cellDates:true en raw devuelve Date objects para celdas de fecha
+  const base = mdata['BASE_PERUFIBRA']||[];
+  const baseRaw = sheets['BASE_PERUFIBRA__raw'] || base; // fallback a display si no hay raw
+  if(base.length < 2) return [];
+
+  const H = base[0]; // headers de la versión display
+  const colOf = k => H.indexOf(k);
+
+  // Índices clave (igual que la macro VBA)
+  const iNeg    = colOf('NEGOCIO');
+  const iQt     = colOf('Quantum');      // Estado Quantum → EN CAMINO / EN PROCESO
+  const iTec    = colOf('Tecnico');
+  const iCod    = colOf('Codigo');
+  const iDni    = colOf('dni_cliente');
+  const iEstado = colOf('Estado');
+  const iTram   = colOf('Tramo');
+  const iHI     = colOf('H_Inicio');    // H_CAMINO en macro
+  const iHP     = colOf('H_Proceso');   // H_PROCESO en macro
+  const iObs    = colOf('Observaciones');
+  const iPaq    = colOf('Paquete');
+
+  // ──────────────────────────────────────────────────────
+  // parseExcelDate: convierte CUALQUIER representación de
+  // fecha que pueda venir del Excel a un objeto Date JS.
+  // Soporta: Date object, número serial Excel, string ISO,
+  // string dd/mm/yyyy hh:mm, string "05/04/2026 19:04", etc.
+  // ──────────────────────────────────────────────────────
+  const parseExcelDate = v => {
+    if(v === null || v === undefined || v === '') return null;
+
+    // Ya es un objeto Date (SheetJS cellDates:true lo convierte directamente)
+    if(v instanceof Date) {
+      return isNaN(v.getTime()) ? null : v;
+    }
+
+    // Número = serial Excel (días desde 1899-12-30 con fracción horaria)
+    // Ejemplo: 46117.795 = 5/abril/2026 19:04:48
+    if(typeof v === 'number' && v > 40000 && v < 110000) {
+      const excelEpoch = new Date(1899, 11, 30).getTime(); // 30-dic-1899
+      return new Date(excelEpoch + v * 86400000);
+    }
+
+    const s = String(v).trim();
+    if(!s || s === '—' || s === 'null' || s === 'undefined') return null;
+
+    let m;
+
+    // "05/04/2026 19:04" o "05/04/2026 19:04:49"
+    m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+    if(m) {
+      const d = new Date(+m[3], +m[2]-1, +m[1], +(m[4]||0), +(m[5]||0), +(m[6]||0));
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    // "2026-04-05 19:04:49" o ISO "2026-04-05T19:04:49"
+    m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/);
+    if(m) {
+      const d = new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +(m[6]||0));
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    // Último recurso: new Date(string)
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  };
+
+  const records = [];
+
+  // Iterar filas de display para texto, pero fechas desde raw
+  base.slice(1).forEach((row, idx) => {
+    if(!row[iCod]) return;
+
+    // FILTRO 1: solo ALTA NUEVA
+    const negocio = String(row[iNeg]||'').trim().toUpperCase();
+    if(negocio !== 'ALTA NUEVA') return;
+
+    // FILTRO 2: solo EN CAMINO o EN PROCESO (columna Quantum)
+    const quantum = String(row[iQt]||'').trim().toUpperCase();
+    if(quantum !== 'EN CAMINO' && quantum !== 'EN PROCESO') return;
+
+    // Leer H_Inicio y H_Proceso preferentemente desde raw (mayor precisión)
+    const rawRow = baseRaw[idx + 1] || row;
+    const rawHI = rawRow[iHI] !== undefined && rawRow[iHI] !== '' ? rawRow[iHI] : row[iHI];
+    const rawHP = rawRow[iHP] !== undefined && rawRow[iHP] !== '' ? rawRow[iHP] : row[iHP];
+
+    const dHI = parseExcelDate(rawHI);
+    const dHP = parseExcelDate(rawHP);
+
+    // ── LÓGICA VBA EXACTA para elegir fechaUsar: ──
+    // EN CAMINO: max(H_Inicio, H_Proceso) si ambos existen
+    // EN PROCESO: H_Proceso primero, sino H_Inicio
+    let fechaUsar = null;
+    if(quantum === 'EN CAMINO'){
+      if(dHI && dHP)  fechaUsar = dHP >= dHI ? dHP : dHI;
+      else if(dHP)    fechaUsar = dHP;
+      else if(dHI)    fechaUsar = dHI;
+    } else {
+      if(dHP)         fechaUsar = dHP;
+      else if(dHI)    fechaUsar = dHI;
+    }
+
+    // MARCO VALENCIA → SERGIO ALVARADO (igual que macro)
+    let tecnico = String(row[iTec]||'').trim();
+    if(tecnico.toUpperCase() === 'MARCO VALENCIA') tecnico = 'SERGIO ALVARADO';
+
+    records.push({
+      tecnico,
+      codigo:        String(row[iCod]||''),
+      dni:           String(row[iDni]||''),
+      estadoPF:      String(row[iEstado]||''),
+      quantum,
+      tramo:         String(row[iTram]||''),
+      hCamino:       dHI ? fmtDateTime(dHI) : '—',
+      hProceso:      dHP ? fmtDateTime(dHP) : '—',
+      fechaUsar,     // ← Date object preciso, base del cronómetro
+      observaciones: String(row[iObs]||''),
+      paquete:       String(row[iPaq]||''),
+    });
+  });
+
+  return records;
+}
+
+function fmtDateTime(d){
+  if(!d) return '—';
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mi = String(d.getMinutes()).padStart(2,'0');
+  return `${dd}/${mm} ${hh}:${mi}`;
+}
+
+// Convierte milisegundos a "HH:MM:SS" (mismo formato que [h]:mm:ss de Excel)
+function fmtElapsed(ms){
+  if(ms < 0) ms = 0;
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// Calcula prioridad según lógica VBA exacta
+function calcPrioridad(quantum, deltaMs){
+  // En camino: >1h=3, >35min(0.024306 días)=2, else=1
+  // En proceso: >2h=3, >1h=2, else=1
+  const h = deltaMs / 3600000;
+  if(quantum === 'EN CAMINO'){
+    if(h > 1)    return 3;
+    if(h > 0.5833) return 2; // 35 min = 0.024306 días = 0.5833h
+    return 1;
+  } else { // EN PROCESO
+    if(h > 2) return 3;
+    if(h > 1) return 2;
+    return 1;
   }
-  // Si es string, intentar parsear
-  const parsed = new Date(serial);
-  if (!isNaN(parsed)) return parsed;
+}
+
+// Color de alerta (formato condicional Excel replicado)
+function alertaColor(quantum, deltaMs){
+  const h = deltaMs / 3600000;
+  if(quantum === 'EN CAMINO'){
+    if(h > 1)      return {bg:'#c00000', text:'#ffffff', label:'CRÍTICO'};
+    if(h > 0.5833) return {bg:'#ffbf00', text:'#000000', label:'ALERTA'};
+  } else {
+    if(h > 2)  return {bg:'#c00000', text:'#ffffff', label:'CRÍTICO'};
+    if(h > 1)  return {bg:'#ffbf00', text:'#000000', label:'ALERTA'};
+  }
   return null;
 }
 
-// ====================== NUEVA FUNCIÓN: CÁLCULO DINÁMICO DE TIEMPO ======================
-// Esta función replica EXACTAMENTE la lógica de la macro de Excel
-function calcularTiempoTranscurrido(estado, hInicio, hProceso) {
-  // Obtener la fecha/hora actual del sistema
-  const ahora = new Date();
-  
-  let fechaUsar = null;
-  
-  // Convertir las fechas si son números seriales de Excel
-  let fechaInicio = excelDateToJSDate(hInicio);
-  let fechaProceso = excelDateToJSDate(hProceso);
-  
-  // Según el estado, determinar qué fecha usar (misma lógica que la macro)
-  if (estado === 'EN CAMINO') {
-    // Para EN CAMINO: usar la fecha más reciente entre H_Inicio y H_Proceso
-    if (fechaInicio && fechaProceso) {
-      fechaUsar = fechaProceso >= fechaInicio ? fechaProceso : fechaInicio;
-    } else if (fechaProceso) {
-      fechaUsar = fechaProceso;
-    } else if (fechaInicio) {
-      fechaUsar = fechaInicio;
+function priColor(p){ return p===3?'#c00000':p===2?'#e67700':'#2f9e44'; }
+function priLabel(p){ return p===3?'🔴 P3 · CRÍTICO':p===2?'🟡 P2 · ALERTA':'🟢 P1 · Normal'; }
+
+// Actualiza solo los contadores dinámicos (sin re-renderizar el HTML)
+function tickTiempo(){
+  const now = Date.now();
+  const nowDate = new Date(now);
+
+  // Actualizar reloj del sistema en la cabecera del panel
+  const clockEl = document.getElementById('tc-sysclock');
+  if(clockEl){
+    const hh = String(nowDate.getHours()).padStart(2,'0');
+    const mm = String(nowDate.getMinutes()).padStart(2,'0');
+    const ss = String(nowDate.getSeconds()).padStart(2,'0');
+    const dd = String(nowDate.getDate()).padStart(2,'0');
+    const mo = String(nowDate.getMonth()+1).padStart(2,'0');
+    const yy = nowDate.getFullYear();
+    clockEl.textContent = `${dd}/${mo}/${yy}  ${hh}:${mm}:${ss}`;
+  }
+
+  // Contadores de alerta para actualizar el resumen
+  let criticos = 0, alertas = 0;
+
+  _tiempoRecords.forEach((rec, i) => {
+    const elEl  = document.getElementById(`tc-elapsed-${i}`);
+    const priEl = document.getElementById(`tc-prio-${i}`);
+    const rowEl = document.getElementById(`tc-card-${i}`);
+    if(!elEl) return;
+
+    if(!rec.fechaUsar){
+      elEl.textContent = '—';
+      return;
     }
-  } else if (estado === 'EN PROCESO') {
-    // Para EN PROCESO: priorizar H_Proceso, si no existe usar H_Inicio
-    if (fechaProceso) {
-      fechaUsar = fechaProceso;
-    } else if (fechaInicio) {
-      fechaUsar = fechaInicio;
+
+    // ← CÁLCULO DINÁMICO: siempre now - fechaUsar fija del Excel
+    const deltaMs = Math.max(0, now - rec.fechaUsar.getTime());
+
+    const pri    = calcPrioridad(rec.quantum, deltaMs);
+    const alerta = alertaColor(rec.quantum, deltaMs);
+
+    if(pri === 3) criticos++;
+    else if(pri === 2) alertas++;
+
+    // Texto del cronómetro: HH:MM:SS siempre creciente
+    elEl.textContent = fmtElapsed(deltaMs);
+    elEl.style.color = alerta ? alerta.bg : 'var(--primary)';
+
+    // Badge de prioridad
+    if(priEl){
+      priEl.textContent  = priLabel(pri);
+      priEl.style.background   = pri===3?'#fff0f0' : pri===2?'var(--yellow-bg)':'var(--green-bg)';
+      priEl.style.color        = priColor(pri);
+      priEl.style.borderColor  = pri===3?'var(--red-mid)':pri===2?'var(--yellow-mid)':'var(--green-mid)';
     }
-  }
-  
-  // Si no hay fecha válida, retornar null
-  if (!fechaUsar || isNaN(fechaUsar.getTime())) {
-    return null;
-  }
-  
-  // Calcular la diferencia (ahora - fechaUsar) en días
-  let delta = (ahora - fechaUsar) / (1000 * 60 * 60 * 24);
-  
-  // Si delta es negativo (fecha futura), mostrar como 0
-  if (delta < 0) {
-    delta = 0;
-  }
-  
-  // Formatear como [h]:mm (horas:minutos)
-  const horasTotales = delta * 24;
-  const horas = Math.floor(horasTotales);
-  const minutos = Math.floor((horasTotales - horas) * 60);
-  
-  return {
-    delta: delta,
-    horasTotales: horasTotales,
-    texto: `${horas}:${minutos.toString().padStart(2, '0')}`,
-    fechaReferencia: fechaUsar
-  };
+
+    // Fondo de fila según alerta (como formato condicional Excel)
+    if(rowEl){
+      rowEl.style.background  = pri===3?'#fff5f5' : pri===2?'#fffbeb':'';
+      rowEl.style.borderLeft  = alerta ? `3px solid ${alerta.bg}` : '';
+    }
+  });
+
+  // Actualizar KPI críticos y alertas dinámicamente
+  const elCrit = document.getElementById('tc-kpi-crit');
+  const elAlert = document.getElementById('tc-kpi-alert');
+  if(elCrit)  elCrit.textContent  = criticos;
+  if(elAlert) elAlert.textContent = alertas;
 }
 
-// Calcular prioridad según la misma lógica de la macro
-function calcularPrioridad(estado, delta) {
-  if (delta === null) return 1;
-  
-  if (estado === 'EN CAMINO') {
-    // Si delta > 1 hora (1/24 día) -> prioridad 3
-    if (delta > 1 / 24) {
-      return 3;
-    }
-    // Si delta > 35 minutos (0.024306 días) -> prioridad 2
-    else if (delta > 0.024306) {
-      return 2;
-    }
-  } else if (estado === 'EN PROCESO') {
-    // Si delta > 2 horas -> prioridad 3
-    if (delta > 2 / 24) {
-      return 3;
-    }
-    // Si delta > 1 hora -> prioridad 2
-    else if (delta > 1 / 24) {
-      return 2;
-    }
-  }
-  return 1;
-}
+function renderTiempo(){
+  // Detener intervalo previo
+  if(_tiempoInterval){ clearInterval(_tiempoInterval); _tiempoInterval = null; }
 
-// Obtener color según prioridad (mismos colores que la macro)
-function getColorPorPrioridad(prioridad) {
-  if (prioridad === 3) {
-    return { bg: '#c00000', text: '#ffffff' };  // Rojo
-  } else if (prioridad === 2) {
-    return { bg: '#ffbf00', text: '#000000' };  // Amarillo
-  }
-  return { bg: '#ffffff', text: '#1a1d2e' };    // Normal
-}
+  const container = document.getElementById('bodyTiempo');
 
-// ====================== NUEVA VERSIÓN DE RENDER TIEMPO ======================
-function renderTiempo() {
-  const base = mdata['BASE_PERUFIBRA'] || [];
-  if (!base.length) {
-    document.getElementById('bodyTiempo').innerHTML = '<div class="empty-state"><div class="ei">⏱</div><p>No hay datos cargados</p></div>';
+  // Construir registros con lógica VBA
+  _tiempoRecords = buildTiempoRecords();
+
+  if(!_tiempoRecords.length){
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="ei">⏱</div>
+        <p style="font-weight:600">Sin órdenes EN CAMINO o EN PROCESO</p>
+        <p style="font-size:0.8rem;margin-top:0.25rem">Solo se muestran órdenes de ALTA NUEVA con estado Quantum activo</p>
+      </div>`;
     return;
   }
-  
-  const H = base[0];
-  const rows = base.slice(1).filter(r => r[0] && r[0] !== '');
-  
-  // Índices de columnas necesarias
-  const tecnicoIdx = H.indexOf('Tecnico');
-  const codigoIdx = H.indexOf('Codigo');
-  const dniIdx = H.indexOf('dni_cliente');
-  const estadoIdx = H.indexOf('Estado');
-  const quantumIdx = H.indexOf('Quantum');
-  const tramoIdx = H.indexOf('Tramo');
-  const hInicioIdx = H.indexOf('H_Inicio');
-  const hProcesoIdx = H.indexOf('H_Proceso');
-  const observacionesIdx = H.indexOf('Observaciones');
-  const negocioIdx = H.indexOf('NEGOCIO');
-  
-  // Filtrar solo registros con NEGOCIO = "ALTA NUEVA" y estado EN CAMINO o EN PROCESO
-  const estadosValidos = ['EN CAMINO', 'EN PROCESO'];
-  const tiempoRows = rows.filter(r => {
-    const negocio = String(r[negocioIdx] || '').toUpperCase();
-    const estado = String(r[estadoIdx] || '').toUpperCase();
-    return negocio === 'ALTA NUEVA' && estadosValidos.includes(estado);
+
+  // Calcular delta inicial para ordenar (PRIORIDAD DESC, TIEMPO DESC — igual que macro)
+  const now = Date.now();
+  _tiempoRecords.forEach(r => {
+    r._deltaMs = r.fechaUsar ? Math.max(0, now - r.fechaUsar.getTime()) : 0;
+    r._pri = calcPrioridad(r.quantum, r._deltaMs);
   });
-  
-  if (!tiempoRows.length) {
-    document.getElementById('bodyTiempo').innerHTML = '<div class="empty-state"><div class="ei">⏱</div><p>No hay órdenes activas con seguimiento de tiempo</p></div>';
-    return;
-  }
-  
-  // Procesar cada fila con cálculos dinámicos (misma lógica que la macro)
-  const processedRows = tiempoRows.map(row => {
-    const tecnico = String(row[tecnicoIdx] || '—');
-    const codigo = String(row[codigoIdx] || '—');
-    const dni = String(row[dniIdx] || '—');
-    const estado = String(row[estadoIdx] || '').toUpperCase();
-    const quantum = String(row[quantumIdx] || '—');
-    const tramo = String(row[tramoIdx] || '—');
-    const hInicio = row[hInicioIdx];
-    const hProceso = row[hProcesoIdx];
-    const observaciones = String(row[observacionesIdx] || '');
-    
-    // Aplicar regla especial: si el técnico es "MARCO VALENCIA", cambiarlo a "SERGIO ALVARADO"
-    let tecnicoFinal = tecnico;
-    if (tecnicoFinal.toUpperCase() === 'MARCO VALENCIA') {
-      tecnicoFinal = 'SERGIO ALVARADO';
-    }
-    
-    // Calcular tiempo usando la misma lógica que la macro
-    const tiempoCalc = calcularTiempoTranscurrido(estado, hInicio, hProceso);
-    const delta = tiempoCalc ? tiempoCalc.delta : null;
-    const prioridad = calcularPrioridad(estado, delta);
-    const colores = getColorPorPrioridad(prioridad);
-    
-    // Formatear fechas para mostrar
-    const fechaInicio = excelDateToJSDate(hInicio);
-    const fechaProceso = excelDateToJSDate(hProceso);
-    
-    const hInicioStr = fechaInicio ? fechaInicio.toLocaleString() : '—';
-    const hProcesoStr = fechaProceso ? fechaProceso.toLocaleString() : '—';
-    
-    return {
-      tecnico: tecnicoFinal,
-      codigo,
-      dni,
-      estado,
-      quantum,
-      tramo,
-      hInicio: hInicioStr,
-      hProceso: hProcesoStr,
-      tiempoTexto: tiempoCalc ? tiempoCalc.texto : '0:00',
-      prioridad,
-      colores,
-      observaciones,
-      delta: delta
-    };
-  });
-  
-  // Ordenar: prioridad descendente, luego tiempo descendente
-  processedRows.sort((a, b) => {
-    if (a.prioridad !== b.prioridad) return b.prioridad - a.prioridad;
-    const deltaA = a.delta || 0;
-    const deltaB = b.delta || 0;
-    return deltaB - deltaA;
-  });
-  
-  // Detectar duplicados por técnico (misma lógica que la macro)
-  const tecnicoCount = {};
-  processedRows.forEach(r => {
-    tecnicoCount[r.tecnico] = (tecnicoCount[r.tecnico] || 0) + 1;
-  });
-  
-  // Generar HTML
-  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin-bottom:1.5rem">';
-  
-  processedRows.forEach((item) => {
-    const isDuplicate = tecnicoCount[item.tecnico] > 1;
-    // Fondo rosa claro para técnicos con múltiples órdenes (como la macro)
-    const duplicateStyle = isDuplicate ? 'background: #fff5f5; border: 2px solid #ffcdcd;' : '';
-    
-    // Determinar color de borde según prioridad
-    let borderColor = '#e2e6ef';
-    if (item.prioridad === 3) borderColor = '#c00000';
-    else if (item.prioridad === 2) borderColor = '#ffbf00';
-    
-    html += `
-      <div class="card" style="${duplicateStyle} border-left: 4px solid ${borderColor};">
-        <div class="card-head" style="background: ${item.colores.bg};">
-          <span class="card-title" style="color: ${item.colores.text};">👷 ${item.tecnico}</span>
-          <span class="badge ${badgeCls(item.estado)}">${item.estado}</span>
-        </div>
-        <div class="card-body" style="display:flex;flex-direction:column;gap:0.6rem">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-size:0.75rem;color:var(--text2)">Código / DNI</span>
-            <span style="font-family:JetBrains Mono,monospace;font-size:0.8rem;font-weight:600">${item.codigo} / ${item.dni}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="font-size:0.75rem;color:var(--text2)">Quantum</span>
-            <span class="badge ${badgeCls(item.quantum)}">${item.quantum}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="font-size:0.75rem;color:var(--text2)">Tramo</span>
-            <span style="font-size:0.8rem;font-weight:600">${item.tramo}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="font-size:0.75rem;color:var(--text2)">H_CAMINO</span>
-            <span style="font-size:0.8rem;font-weight:600;font-family:JetBrains Mono,monospace">${item.hInicio}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="font-size:0.75rem;color:var(--text2)">H_PROCESO</span>
-            <span style="font-size:0.8rem;font-weight:600;font-family:JetBrains Mono,monospace">${item.hProceso}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;background:${item.colores.bg};padding:10px;border-radius:8px;margin-top:4px">
-            <span style="font-size:0.75rem;color:${item.colores.text};font-weight:700">⏱ TIEMPO TOTAL</span>
-            <div style="text-align:right">
-              <span style="font-size:1.3rem;font-weight:800;font-family:JetBrains Mono,monospace;color:${item.colores.text}">${item.tiempoTexto}</span>
-              ${item.prioridad > 1 ? `<div style="font-size:0.7rem;color:${item.colores.text};margin-top:2px;font-weight:600">⚠️ Prioridad ${item.prioridad} ${item.prioridad === 3 ? 'Crítica' : 'Demora'}</div>` : ''}
-            </div>
-          </div>
-          ${item.observaciones ? `<div style="font-size:0.75rem;color:var(--text2);border-top:1px solid var(--border);padding-top:0.5rem;line-height:1.4">📝 ${item.observaciones}</div>` : ''}
-        </div>
+  _tiempoRecords.sort((a,b) => b._pri - a._pri || b._deltaMs - a._deltaMs);
+
+  // Conteo de estados
+  const enCamino = _tiempoRecords.filter(r=>r.quantum==='EN CAMINO').length;
+  const enProceso = _tiempoRecords.filter(r=>r.quantum==='EN PROCESO').length;
+  const criticos = _tiempoRecords.filter(r=>r._pri===3).length;
+  const alertas = _tiempoRecords.filter(r=>r._pri===2).length;
+
+  let html = `
+    <!-- BARRA SUPERIOR: RELOJ + KPIs -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem;flex-wrap:wrap;gap:0.75rem">
+      <div style="display:flex;align-items:center;gap:10px;background:var(--primary-light);border:1.5px solid var(--primary-mid);border-radius:10px;padding:8px 16px">
+        <span style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--primary)">🕐 Hora del sistema</span>
+        <span id="tc-sysclock" style="font-family:JetBrains Mono,monospace;font-size:1.05rem;font-weight:800;color:var(--text);letter-spacing:0.04em">--/--/----  --:--:--</span>
       </div>
-    `;
-  });
-  
-  html += '</div>';
-  
-  // Mostrar resumen de tiempos (como la macro)
-  const enCamino = processedRows.filter(r => r.estado === 'EN CAMINO').length;
-  const enProceso = processedRows.filter(r => r.estado === 'EN PROCESO').length;
-  const prioridad3 = processedRows.filter(r => r.prioridad === 3).length;
-  const prioridad2 = processedRows.filter(r => r.prioridad === 2).length;
-  
-  html += `
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-head"><span class="card-title">📊 Resumen de Tiempos</span></div>
-        <div class="card-body">
-          <div class="stat-row"><span class="stat-name">Total Activas</span><div class="stat-track"><div class="stat-fill" style="width:100%;background:#3b5bdb"></div></div><span class="stat-count">${processedRows.length}</span></div>
-          <div class="stat-row"><span class="stat-name">En Camino</span><div class="stat-track"><div class="stat-fill" style="width:${processedRows.length ? (enCamino/processedRows.length*100) : 0}%;background:#1971c2"></div></div><span class="stat-count">${enCamino}</span></div>
-          <div class="stat-row"><span class="stat-name">En Proceso</span><div class="stat-track"><div class="stat-fill" style="width:${processedRows.length ? (enProceso/processedRows.length*100) : 0}%;background:#7048e8"></div></div><span class="stat-count">${enProceso}</span></div>
-          <div class="stat-row"><span class="stat-name">⚠️ Prioridad 3</span><div class="stat-track"><div class="stat-fill" style="width:${processedRows.length ? (prioridad3/processedRows.length*100) : 0}%;background:#c00000"></div></div><span class="stat-count">${prioridad3}</span></div>
-          <div class="stat-row"><span class="stat-name">⚠️ Prioridad 2</span><div class="stat-track"><div class="stat-fill" style="width:${processedRows.length ? (prioridad2/processedRows.length*100) : 0}%;background:#ffbf00"></div></div><span class="stat-count">${prioridad2}</span></div>
-        </div>
+      <div style="font-size:0.72rem;color:var(--text2);font-style:italic">Tiempo = Hora Sistema − H_Inicio o H_Proceso del Excel · actualiza cada 1 segundo</div>
+    </div>
+
+    <!-- RESUMEN KPI -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:0.85rem;margin-bottom:1.5rem">
+      <div class="kpi" style="--kpi-color:#1971c2">
+        <div class="kpi-label">En Camino</div>
+        <div class="kpi-val">${enCamino}</div>
+        <div class="kpi-sub">Desplazándose</div>
       </div>
-      <div class="card">
-        <div class="card-head"><span class="card-title">ℹ️ Leyenda de Prioridades</span></div>
-        <div class="card-body">
-          <div style="display:flex;flex-direction:column;gap:8px">
-            <div style="display:flex;align-items:center;gap:8px"><div style="width:20px;height:20px;background:#ffbf00;border-radius:4px"></div><span style="font-size:0.75rem">Prioridad 2 - Demora leve (EN CAMINO >35min / EN PROCESO >1h)</span></div>
-            <div style="display:flex;align-items:center;gap:8px"><div style="width:20px;height:20px;background:#c00000;border-radius:4px"></div><span style="font-size:0.75rem">Prioridad 3 - Demora crítica (EN CAMINO >1h / EN PROCESO >2h)</span></div>
-            <div style="display:flex;align-items:center;gap:8px;margin-top:4px"><div style="width:20px;height:20px;background:#ffcdcd;border-radius:4px;border:1px solid #ffa8a8"></div><span style="font-size:0.75rem">Fondo rosa claro = Técnico con múltiples órdenes activas</span></div>
-          </div>
-        </div>
+      <div class="kpi" style="--kpi-color:#7048e8">
+        <div class="kpi-label">En Proceso</div>
+        <div class="kpi-val">${enProceso}</div>
+        <div class="kpi-sub">Atendiendo</div>
+      </div>
+      <div class="kpi" style="--kpi-color:#c00000">
+        <div class="kpi-label">🔴 Críticos P3</div>
+        <div class="kpi-val" id="tc-kpi-crit">${criticos}</div>
+        <div class="kpi-sub">&gt; umbral máximo</div>
+      </div>
+      <div class="kpi" style="--kpi-color:#e67700">
+        <div class="kpi-label">🟡 Alertas P2</div>
+        <div class="kpi-val" id="tc-kpi-alert">${alertas}</div>
+        <div class="kpi-sub">próximos a vencer</div>
+      </div>
+      <div class="kpi" style="--kpi-color:#868e96">
+        <div class="kpi-label">Total activos</div>
+        <div class="kpi-val">${_tiempoRecords.length}</div>
+        <div class="kpi-sub">ALTA NUEVA</div>
       </div>
     </div>
-  `;
-  
-  document.getElementById('bodyTiempo').innerHTML = html;
+
+    <!-- LEYENDA -->
+    <div style="display:flex;gap:0.6rem;flex-wrap:wrap;margin-bottom:1.25rem;align-items:center">
+      <span style="font-size:0.72rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.06em">Semáforo:</span>
+      <span style="font-size:0.72rem;background:#fff0f0;color:#c00000;border:1px solid var(--red-mid);padding:3px 10px;border-radius:6px;font-weight:700">🔴 P3 Crítico — EN CAMINO >1h · EN PROCESO >2h</span>
+      <span style="font-size:0.72rem;background:var(--yellow-bg);color:var(--yellow);border:1px solid var(--yellow-mid);padding:3px 10px;border-radius:6px;font-weight:700">🟡 P2 Alerta — EN CAMINO >35min · EN PROCESO >1h</span>
+      <span style="font-size:0.72rem;background:var(--green-bg);color:var(--green);border:1px solid var(--green-mid);padding:3px 10px;border-radius:6px;font-weight:700">🟢 P1 Normal</span>
+      <span style="margin-left:auto;font-size:0.72rem;color:var(--text3);font-style:italic">⟳ actualiza cada segundo</span>
+    </div>
+
+    <!-- TABLA DE REGISTROS -->
+    <div class="card" style="margin-bottom:1.5rem">
+      <div class="card-head" style="justify-content:space-between">
+        <span class="card-title">⏱ Control de Tiempo — ALTA NUEVA activos</span>
+        <span style="font-size:0.72rem;color:var(--text2)">${_tiempoRecords.length} registros · ordenado por prioridad ↓ tiempo ↓</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Técnico</th>
+              <th>Código</th>
+              <th>DNI</th>
+              <th>Estado PF</th>
+              <th>Quantum</th>
+              <th>Tramo</th>
+              <th>H. Camino (inicio)</th>
+              <th>H. Proceso</th>
+              <th style="min-width:110px">⏱ TIEMPO TRANSCURRIDO</th>
+              <th>Prioridad</th>
+              <th>Observaciones</th>
+            </tr>
+          </thead>
+          <tbody>`;
+
+  _tiempoRecords.forEach((rec, i) => {
+    const alerta = alertaColor(rec.quantum, rec._deltaMs);
+    const rowBg = rec._pri===3?'#fff5f5':rec._pri===2?'#fffbeb':'';
+    html += `<tr id="tc-card-${i}" style="background:${rowBg}">
+      <td style="font-weight:700;color:var(--text3)">${i+1}</td>
+      <td style="font-weight:700;max-width:140px;overflow:hidden;text-overflow:ellipsis" title="${rec.tecnico}">${rec.tecnico}</td>
+      <td style="font-family:JetBrains Mono,monospace;font-size:0.78rem;font-weight:600">${rec.codigo}</td>
+      <td style="font-family:JetBrains Mono,monospace;font-size:0.75rem;color:var(--text2)">${rec.dni}</td>
+      <td><span class="badge ${badgeCls(rec.estadoPF)}">${rec.estadoPF||'—'}</span></td>
+      <td><span class="badge ${rec.quantum==='EN CAMINO'?'b-camino':'b-proceso'}">${rec.quantum}</span></td>
+      <td style="font-size:0.78rem;font-weight:600">${rec.tramo}</td>
+      <td style="font-family:JetBrains Mono,monospace;font-size:0.78rem;color:var(--text2)">${rec.hCamino}</td>
+      <td style="font-family:JetBrains Mono,monospace;font-size:0.78rem;color:var(--text2)">${rec.hProceso}</td>
+      <td>
+        <span id="tc-elapsed-${i}"
+          style="font-family:JetBrains Mono,monospace;font-size:1rem;font-weight:800;color:${alerta?alerta.bg:'var(--primary)'};letter-spacing:-0.02em">
+          ${rec.fechaUsar ? fmtElapsed(rec._deltaMs) : '—'}
+        </span>
+      </td>
+      <td>
+        <span id="tc-prio-${i}" style="font-size:0.7rem;font-weight:700;padding:3px 9px;border-radius:6px;border:1px solid;
+          background:${rec._pri===3?'#fff0f0':rec._pri===2?'var(--yellow-bg)':'var(--green-bg)'};
+          color:${priColor(rec._pri)};
+          border-color:${rec._pri===3?'var(--red-mid)':rec._pri===2?'var(--yellow-mid)':'var(--green-mid)'}">
+          ${priLabel(rec._pri)}
+        </span>
+      </td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;font-size:0.75rem;color:var(--text2)" title="${rec.observaciones}">${rec.observaciones||'—'}</td>
+    </tr>`;
+  });
+
+  html += `</tbody></table></div></div>`;
+
+  // Resumen por técnico (duplicados en col A = técnico repetido)
+  const tecCount = {};
+  _tiempoRecords.forEach(r=>{ tecCount[r.tecnico]=(tecCount[r.tecnico]||0)+1; });
+  const dupTecs = Object.entries(tecCount).filter(([,c])=>c>1);
+
+  if(dupTecs.length){
+    html += `<div class="card">
+      <div class="card-head"><span class="card-title">⚠️ Técnicos con múltiples órdenes activas</span></div>
+      <div class="card-body" style="display:flex;gap:0.6rem;flex-wrap:wrap">
+        ${dupTecs.map(([t,c])=>`<span style="background:#fff0f0;color:#c00000;border:1px solid var(--red-mid);padding:4px 12px;border-radius:8px;font-size:0.78rem;font-weight:700">${t} · ${c} órdenes</span>`).join('')}
+      </div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
+
+  // Arrancar tick dinámico (cada 1 segundo)
+  _tiempoInterval = setInterval(tickTiempo, 1000);
 }
 
 function renderIndicadores(){
@@ -2087,6 +2223,7 @@ function saveModal(){
   closeModal();
   if(changed){
     toast(`✅ ${changed} campo(s) actualizados`, 'success');
+    // Re-render current panel
     const activeNav = document.querySelector('[data-nav].active');
     if(activeNav) nav(activeNav.dataset.nav);
     if(modalSheet==='BASE_PERUFIBRA') buildDashboard();
@@ -2137,6 +2274,7 @@ function openNewRecord(){
 function saveNewRecord(){
   const H = getHeaders('BASE_PERUFIBRA');
   const newRow = new Array(H.length).fill('');
+  // Auto id
   const rows = getRows('BASE_PERUFIBRA');
   const maxId = rows.reduce((m,r)=>Math.max(m,parseInt(r[0])||0),0);
   newRow[0] = String(maxId+1);
@@ -2149,8 +2287,10 @@ function saveNewRecord(){
     if(idx>=0) newRow[idx]=el.value;
   });
 
+  // Sync Estado to Estado_1
   const eIdx=H.indexOf('Estado'), e1Idx=H.indexOf('Estado_1');
   if(eIdx>=0 && e1Idx>=0) newRow[e1Idx]=newRow[eIdx];
+  // Sync Cliente to nom_cliente
   const ncIdx=H.indexOf('nom_cliente'), cIdx=H.indexOf('Cliente');
   if(ncIdx>=0 && cIdx>=0 && newRow[cIdx]==='') newRow[cIdx]=newRow[ncIdx];
 
